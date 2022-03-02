@@ -1,0 +1,10 @@
+Kumar, Tilak (Data & Analytics, Services) 07:20: 
+https://confluence.dts.fm.rbsgrp.net/display/APD/VCSe3+Data+Science+Installs#VCSe3DataScienceInstalls-Miniconda3
+Kumar, Tilak (Data & Analytics, Services) 07:34: 
+conda config --add channels conda-forge 
+conda config --remove channels defaults 
+
+Kumar, Tilak (Data & Analytics, Services) 09:06: 
+conda create -y -n pythonenv numpy pandas jupyterlab  
+Kumar, Tilak (Data & Analytics, Services) 09:16: 
+conda activate pythonenv
