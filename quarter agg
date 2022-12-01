@@ -1,0 +1,572 @@
+from pyspark import StorageLevel
+import time
+from pyspark.sql import SparkSession
+from pyspark import SparkConf
+from pyspark.sql.types import Row, DoubleType, StringType
+from pyspark.sql.functions import col,lit,sum,broadcast, expr
+from pyspark.sql.types import *
+
+
+def get_spark_session():
+    print("\n\nCreating Spark Session Object..\n\n")
+    spark = SparkSession.builder.appName("CREATE_RWA_REPORTING_QTR_AGG_MART").enableHiveSupport().getOrCreate()
+    spark.sparkContext.setLogLevel("ERROR");
+    spark.conf.set("spark.sql.crossJoin.enabled", True);
+    spark.conf.set("spark.sql.parquet.enableVectorizedReader", False);
+    spark.conf.set("hive.exec.dynamic.partition.mode", "nonstrict");
+
+    return spark
+#   end get_spark_session()
+
+
+def initialize_db(db_name, spark):
+    value = "use " + db_name
+    spark.sql(value)
+#   end of initialize_db()
+
+
+def calculate_obsrvd_new_default_exp_amt_indv(rwa_approach_code, b2_std_obsrvd_new_default_flag, b2_std_fully_adj_exp_ccf_50, b2_std_fully_adj_exp_ccf_20,
+												b2_std_fully_adj_exp_ccf_0, b2_std_eff_fin_coll_amt, b2_std_netted_coll_gbp, b2_std_crm_tot_outflow,
+												b2_std_crm_tot_inflow, b2_std_provisions_amt, b2_irb_obsrvd_new_default_flag, b2_irb_orig_exp_pre_con_factor,
+												b2_std_exposure_value):
+	if (b2_std_obsrvd_new_default_flag is None):
+		b2_std_obsrvd_new_default_flag = 'N';
+		
+	if (rwa_approach_code is None):
+		rwa_approach_code = '';
+		
+	if (b2_std_exposure_value is None):
+		b2_std_exposure_value = 0.0;
+					
+	if (b2_std_fully_adj_exp_ccf_50 is None):
+		b2_std_fully_adj_exp_ccf_50 = 0.0;
+		
+	if (b2_std_fully_adj_exp_ccf_20 is None):
+		b2_std_fully_adj_exp_ccf_20 = 0.0;
+		
+	if (b2_std_fully_adj_exp_ccf_0 is None):
+		b2_std_fully_adj_exp_ccf_0 = 0.0;
+		
+	if (b2_std_eff_fin_coll_amt is None):
+		b2_std_eff_fin_coll_amt = 0.0;
+		
+	if (b2_std_netted_coll_gbp is None):
+		b2_std_netted_coll_gbp = 0.0;
+		
+	if (b2_std_crm_tot_outflow is None):
+		b2_std_crm_tot_outflow = 0.0;
+		
+	if (b2_std_crm_tot_inflow is None):
+		b2_std_crm_tot_inflow = 0.0;
+		
+	if (b2_std_provisions_amt is None):
+		b2_std_provisions_amt = 0.0;
+		
+	if (b2_irb_obsrvd_new_default_flag is None):
+		b2_irb_obsrvd_new_default_flag = 'N';
+		
+	if (b2_irb_orig_exp_pre_con_factor is None):
+		b2_irb_orig_exp_pre_con_factor = 0.0;
+	
+	if ((rwa_approach_code == 'STD') and (b2_std_obsrvd_new_default_flag == 'Y')):
+		b2_std_fully_adj_exp_ccf_50 = b2_std_fully_adj_exp_ccf_50 * 0.5;
+		b2_std_fully_adj_exp_ccf_20 = b2_std_fully_adj_exp_ccf_20 * 0.8;
+		val0 = b2_std_exposure_value + b2_std_fully_adj_exp_ccf_50 + b2_std_fully_adj_exp_ccf_20 + b2_std_fully_adj_exp_ccf_0;
+		
+		val1 = (b2_std_eff_fin_coll_amt + b2_std_netted_coll_gbp) * (-1);
+		val2 = (b2_std_crm_tot_outflow) * (-1);
+		val3 = val2 + b2_std_crm_tot_inflow;
+		val4 = val0 - val1 - val3;
+		
+		val5 = (b2_std_provisions_amt) * (-1);
+		
+		obsrvd_new_default_exp_amt_indv = val4 - val5;
+	elif ((rwa_approach_code == 'airb') and (b2_irb_obsrvd_new_default_flag == 'y')):
+		obsrvd_new_default_exp_amt_indv = b2_irb_orig_exp_pre_con_factor;
+	else:
+		obsrvd_new_default_exp_amt_indv = 0.0;
+		
+	return obsrvd_new_default_exp_amt_indv;																				
+#	end of calculate_obsrvd_new_default_exp_amt_indv()
+
+
+def calculate_obsrvd_new_default_cr_adj_indv(rwa_approach_code, b2_std_provisions_amt, imp_write_off_amt, b2_irb_provisions_amt):
+	if (b2_std_provisions_amt is None):
+		b2_std_provisions_amt = 0.0;
+		
+	if (imp_write_off_amt is None):
+		imp_write_off_amt = 0.0;
+		
+	if (b2_irb_provisions_amt is None):
+		b2_irb_provisions_amt = 0.0;
+		
+	if ((rwa_approach_code is not None) and (rwa_approach_code == 'STD')):
+		obsrvd_new_default_cr_adj_indv = b2_std_provisions_amt + imp_write_off_amt;
+	elif ((rwa_approach_code is not None) and (rwa_approach_code == 'AIRB')):
+		obsrvd_new_default_cr_adj_indv = b2_irb_provisions_amt + imp_write_off_amt;
+	else:
+		obsrvd_new_default_cr_adj_indv = 0.0;
+	
+	return obsrvd_new_default_cr_adj_indv;
+#	end of calculate_obsrvd_new_default_cr_adj_indv()
+
+
+def get_curr_qtr_mnths(spark,reporting_date_override):
+    query = f'''SELECT DISTINCT
+					date_format((month_end_date), 'YYYYMM') AS CURR_QTR_MNTHS_RK,
+					MONTH_END_DATE AS CURR_QTR_MNTHS
+					FROM rtd_ref.dim_year_month
+					WHERE year_quarter_number = (SELECT DISTINCT year_quarter_number FROM rtd_ref.dim_year_month
+					   WHERE YEAR_MONTH_RK = 202209)
+					   AND year = 2022
+					   AND (month_end_date <= (SELECT month_end_date FROM rtd_ref.dim_year_month WHERE YEAR_MONTH_RK = 202209
+					   AND year = 2022 and month_end_date is not null))'''
+    
+    df = spark.sql(query)
+#	CURR_QTR_MNTHS_RK	CURR_QTR_MNTHS
+#		YYYYMM				31/08/2022
+#		YYYYMM				30/09/2022
+#		YYYYMM				31/07/2022
+    return df
+#	end of get_curr_qtr_mnths()
+	
+
+def enrich_qtr_agg_input(rows):
+	returned_list = [];
+	for current_row in rows:
+		rwa_approach_code = current_row[16];
+		b2_std_obsrvd_new_default_flag = current_row[53];
+		b2_std_exposure_value = current_row[54];
+		b2_std_fully_adj_exp_ccf_50 = current_row[55];
+		b2_std_fully_adj_exp_ccf_20 = current_row[56];
+		b2_std_fully_adj_exp_ccf_0 = current_row[57];
+		b2_std_eff_fin_coll_amt = current_row[58];
+		b2_std_netted_coll_gbp = current_row[59];
+		b2_std_crm_tot_outflow = current_row[60];
+		b2_std_crm_tot_inflow = current_row[61];
+		b2_std_provisions_amt = current_row[62];
+		b2_irb_orig_exp_pre_con_factor = current_row[63]
+		imp_write_off_amt = current_row[64];
+		b2_irb_provisions_amt = current_row[65];
+		b2_irb_obsrvd_new_default_flag = current_row[66];
+				
+		obsrvd_new_default_exp_amt_indv = calculate_obsrvd_new_default_exp_amt_indv(rwa_approach_code, b2_std_obsrvd_new_default_flag, 
+																						b2_std_fully_adj_exp_ccf_50, b2_std_fully_adj_exp_ccf_20,
+																						b2_std_fully_adj_exp_ccf_0, b2_std_eff_fin_coll_amt,
+																						b2_std_netted_coll_gbp, b2_std_crm_tot_outflow,
+																						b2_std_crm_tot_inflow, b2_std_provisions_amt,
+																						b2_irb_obsrvd_new_default_flag, b2_irb_orig_exp_pre_con_factor,
+																						b2_std_exposure_value);
+		
+		obsrvd_new_default_cr_adj_indv = calculate_obsrvd_new_default_cr_adj_indv(rwa_approach_code, b2_std_provisions_amt, imp_write_off_amt,
+																					b2_irb_provisions_amt);																		
+		
+		new_row = Row(YEAR_MONTH = current_row[0], REPORTING_REGULATOR_CODE = current_row[1], RISK_TAKER_LL_RRU = current_row[2], SUB5 = current_row[3],
+						RISK_ON_LL_RRU = current_row[4], COREP_IRB_ASSET_CLASS_RK = current_row[5], COREP_STD_ASSET_CLASS_RK = current_row[6],
+						COREP_PRDEF_STD_ASSET_CLASS_NK = current_row[7], UNSETTLED_PERIOD_CODE = current_row[8], INCORP_ISO_CODE = current_row[9],
+						OP_ISO_CODE = current_row[10], dim_mgs = current_row[11],dim_pd_code = current_row[12],MGS_PD_BAND_type=current_row[13], ADJUST_FLAG = current_row[14], 
+						BASEL_DATA_FLAG = current_row[15], RWA_APPROACH_CODE = rwa_approach_code, ACLM_PRODUCT_TYPE = current_row[17],
+						DEFAULT_FUND_CONTRIB_INDICATOR = current_row[18], SME_FLAG = current_row[19], INTERNAL_TRANSACTION_FLAG = current_row[20],
+						RWA_CALC_METHOD = current_row[21], TRADING_BOOK_FLAG = current_row[22], REPORTING_TYPE_CODE = current_row[23],
+						CRD4_REP_IRB_FLAG = current_row[24], CRD4_REP_IRBEQ_FLAG = current_row[25], CRD4_REP_STD_FLAG = current_row[26],
+						CRD4_REP_STDFLOW_FLAG = current_row[27], CRD4_REP_SETTL_FLAG = current_row[28], PERS_ACC_FLAG = current_row[29],
+						B3_SME_RP_FLAG = current_row[30], B3_SME_DISCOUNT_FLAG = current_row[31], COREP_INCORP_COUNTRY_NK = current_row[32],
+						WALKER_COST_CENTRE_NK = current_row[33], CRD4_MEMO_ITEMS_ASSET_CLASS_RK = current_row[34], IG_EXCLUSION_FLAG = current_row[35],
+						RETAIL_POOL_SME_FLAG = current_row[36], SYS_CODE = current_row[37], DEAL_TYPE = current_row[38], STS_SECURITISATION = current_row[39],
+						STS_SEC_QUAL_CAP_TRTMNT = current_row[40], STS_SEC_APPROACH_CODE = current_row[41], IFRS9_FINAL_STAGE = current_row[42],
+						IFRS9_STAGE_3_TYPE = current_row[43], IFRS9_ECL_CURRENCY_CODE = current_row[44], C33_EXPOSURE_SECTOR = current_row[45],
+						FINREP_COUNTERPARTY_SECTOR = current_row[46], IAS39_CLASS = current_row[47], REP_PROVISION_TYPE = current_row[48],
+						CRR2_501A_DISCOUNT_FLAG = current_row[49], MORTGAGES_FLAG = current_row[50], SECURITY_NK_1_2 = current_row[51],SECURITY_NK_2_2 =current_row[52],
+						B2_STD_OBSRVD_NEW_DEFAULT_FLAG = b2_std_obsrvd_new_default_flag, B2_STD_EXPOSURE_VALUE = b2_std_exposure_value, 
+						B2_STD_FULLY_ADJ_EXP_CCF_50 = b2_std_fully_adj_exp_ccf_50, B2_STD_FULLY_ADJ_EXP_CCF_20 = b2_std_fully_adj_exp_ccf_20, 
+						B2_STD_FULLY_ADJ_EXP_CCF_0 = b2_std_fully_adj_exp_ccf_0, B2_STD_EFF_FIN_COLL_AMT = b2_std_eff_fin_coll_amt, 
+						B2_STD_NETTED_COLL_GBP = b2_std_netted_coll_gbp, B2_STD_CRM_TOT_OUTFLOW = b2_std_crm_tot_outflow, 
+						B2_STD_CRM_TOT_INFLOW = b2_std_crm_tot_inflow, B2_STD_PROVISIONS_AMT = b2_std_provisions_amt,
+						B2_IRB_ORIG_EXP_PRE_CON_FACTOR = b2_irb_orig_exp_pre_con_factor, IMP_WRITE_OFF_AMT = imp_write_off_amt, 
+						B2_IRB_PROVISIONS_AMT = b2_irb_provisions_amt, B2_IRB_OBSRVD_NEW_DEFAULT_FLAG = b2_irb_obsrvd_new_default_flag, 
+						OBSRVD_NEW_DEFAULT_EXP_AMT_INDV = obsrvd_new_default_exp_amt_indv, OBSRVD_NEW_DEFAULT_CR_ADJ_INDV = obsrvd_new_default_cr_adj_indv);
+		returned_list.append(new_row);
+	return returned_list;
+#	end of enrich_qtr_agg_input()
+
+
+def get_input_cols():
+	input_cols = ["B2_STD_OBSRVD_NEW_DEFAULT_FLAG", "B2_STD_EXPOSURE_VALUE",
+					"B2_STD_FULLY_ADJ_EXP_CCF_50", "B2_STD_FULLY_ADJ_EXP_CCF_20", "B2_STD_FULLY_ADJ_EXP_CCF_0", "B2_STD_EFF_FIN_COLL_AMT",
+					"B2_STD_NETTED_COLL_GBP", "B2_STD_CRM_TOT_OUTFLOW", "B2_STD_CRM_TOT_INFLOW", "B2_STD_PROVISIONS_AMT", 
+					"B2_IRB_ORIG_EXP_PRE_CON_FACTOR", "IMP_WRITE_OFF_AMT", "B2_IRB_PROVISIONS_AMT", "B2_IRB_OBSRVD_NEW_DEFAULT_FLAG"];
+	return input_cols;
+#	end of get_input_cols()
+
+
+def get_input_data_group_by_cols():
+	input_df_group_cols = ["YEAR_MONTH", "REPORTING_REGULATOR_CODE", "RISK_TAKER_LL_RRU", "SUB5", "RISK_ON_LL_RRU", "COREP_IRB_ASSET_CLASS_RK", 
+							"COREP_STD_ASSET_CLASS_RK", "COREP_PRDEF_STD_ASSET_CLASS_NK", "UNSETTLED_PERIOD_CODE", "INCORP_ISO_CODE", 
+							"OP_ISO_CODE", "dim_mgs","dim_pd_band_code","MGS_PD_BAND_type", "ADJUST_FLAG", "BASEL_DATA_FLAG", "RWA_APPROACH_CODE", "ACLM_PRODUCT_TYPE", 
+							"DEFAULT_FUND_CONTRIB_INDICATOR", "SME_FLAG", "INTERNAL_TRANSACTION_FLAG", "RWA_CALC_METHOD", "TRADING_BOOK_FLAG", 
+							"REPORTING_TYPE_CODE", "CRD4_REP_IRB_FLAG", "CRD4_REP_IRBEQ_FLAG", "CRD4_REP_STD_FLAG", "CRD4_REP_STDFLOW_FLAG", 
+							"CRD4_REP_SETTL_FLAG", "PERS_ACC_FLAG", "B3_SME_RP_FLAG", "B3_SME_DISCOUNT_FLAG", "COREP_INCORP_COUNTRY_NK", 
+							"WALKER_COST_CENTRE_NK", "CRD4_MEMO_ITEMS_ASSET_CLASS_RK", "IG_EXCLUSION_FLAG", "RETAIL_POOL_SME_FLAG", "SYS_CODE", 
+							"DEAL_TYPE", "STS_SECURITISATION", "STS_SEC_QUAL_CAP_TRTMNT", "STS_SEC_APPROACH_CODE", "IFRS9_FINAL_STAGE", 
+							"IFRS9_STAGE_3_TYPE", "IFRS9_ECL_CURRENCY_CODE", "C33_EXPOSURE_SECTOR", "FINREP_COUNTERPARTY_SECTOR", 
+							"IAS39_CLASS", "REP_PROVISION_TYPE", "CRR2_501A_DISCOUNT_FLAG", "MORTGAGES_FLAG", "SECURITY_NK_1_2","SECURITY_NK_2_2"];
+
+	return input_df_group_cols;
+#	end of get_input_data_group_by_cols()
+	
+							
+def get_qtr_agg_input_df(rwa_reporting_agg_mart_data, filter_cond, extra_col, extra_col_val):
+	final_input_cols = get_input_data_group_by_cols() + get_input_cols();
+	
+	if(extra_col is not None):
+		final_input_cols = final_input_cols + extra_col;
+		rwa_reporting_agg_mart_data = rwa_reporting_agg_mart_data.withColumn(extra_col, lit(extra_col_val));
+		
+	qtr_agg_input_df = rwa_reporting_agg_mart_data.select(final_input_cols);
+	qtr_agg_input_df = qtr_agg_input_df.filter(filter_cond);
+	qtr_agg_input_df = qtr_agg_input_df.withColumn("IRB_RISK_WEIGHT_RATIO", None);
+	
+	return qtr_agg_input_df;
+#	end of get_qtr_agg_input_df()
+
+
+def get_tmp2_qtr_agg_corep_crd4_l1(rwa_reporting_agg_mart_data, curr_qtr_mnths):
+	returned_df = None;
+	
+	for curr_mnth in curr_qtr_mnths:
+		final_input_cols = get_input_data_group_by_cols() + get_input_cols();
+		
+		final_input_cols = final_input_cols + "CURR_QTR_MONTH";
+		rwa_reporting_agg_mart_data = rwa_reporting_agg_mart_data.withColumn("CURR_QTR_MONTH", lit(extra_col_val));
+			
+		qtr_agg_input_df = rwa_reporting_agg_mart_data.select(final_input_cols);
+		qtr_agg_input_df = qtr_agg_input_df.filter(filter_cond);
+		qtr_agg_input_df = qtr_agg_input_df.withColumn("IRB_RISK_WEIGHT_RATIO", None);
+		
+		enriched_tmp2_df = qtr_agg_input_df.rdd.mapPartitions(enrich_qtr_agg_input_for_tmp2).toDF();
+		final_input_df = enriched_tmp2_df.groupBy(input_df_group_cols).agg(sum("OBSRVD_NEW_DEFAULT_EXP_AMT_INDV").alias("OBSRVD_NEW_DEFAULT_EXP_AMT"),
+																			sum("OBSRVD_NEW_DEFAULT_CR_ADJ_INDV").alias("OBSRVD_NEW_DEFAULT_CR_ADJ"));
+																			
+		if (returned_df is None):
+			returned_df = final_input_df;
+		else:
+			returned_df = returned_df.unionByName(final_input_df);
+			
+	return returned_df;
+#	end of get_tmp2_qtr_agg_corep_crd4_l1()
+
+
+def get_tmp_rekeying_l1():
+	query = f'''SELECT /*+ PARALLEL (L1 ,6) */
+               L1.YEAR_MONTH,
+                L1.ORIGINAL_YEAR_MONTH_RK,
+                NVL (RRU_RK_CURRENT.LL_RRU, -1) RISK_TAKER_LL_RRU,
+                NVL (DIVISION_RK_CURRENT.DIVISION_RK, -1) SUB5,
+                NVL (RISK_ON_RRU_RK_CURRENT.LL_RRU, -1) RISK_ON_LL_RRU,
+                NVL (COREP_IRB_CURRENT.ASSET_CLASS_RK, -1) COREP_IRB_ASSET_CLASS_RK,
+                NVL (COREP_STD_CURRENT.ASSET_CLASS_RK, -1) COREP_STD_ASSET_CLASS_RK,
+                NVL (COREP_PRDEF_STD_CURRENT.ASSET_CLASS_RK, -1) COREP_PRDEF_STD_ASSET_CLASS_NK,
+                L1.UNSETTLED_PERIOD_CODE,
+                NVL (INCORP_COUNTRY_RK_CURRENT.ISO_CODE, -1) INCORP_ISO_CODE,
+                NVL (OP_COUNTRY_RK_CURRENT.OP_ISO_CODE, -1) OP_ISO_CODE,
+                NVL (MGS_PD_BAND_CODE_RK_CURRENT.dim_mgs, -1) dim_mgs,
+				NVL (MGS_PD_BAND_CODE_RK_CURRENT.dim_pd_band_code, -1) dim_pd_band_code,
+				NVL (MGS_PD_BAND_CODE_RK_CURRENT.MGS_PD_BAND_type, -1) ,MGS_PD_BAND_type, --R2157:R47.1:gargsi:commented:09/11/201715/01/2017 TC224:R47.3.2:uncommented
+--                -1 MGS_PD_BAND_CODE_RK, --R2157:R47.1:gargsi:added:09/11/2017--defaulted to -115/01/2017 TC224:R47.3.2:commented
+                --L1.RUN_RK,
+                L1.ADJUST_FLAG,
+                L1.REPORTING_REGULATOR_CODE,
+                L1.BASEL_DATA_FLAG,
+                L1.RWA_APPROACH_CODE,
+                L1.ACLM_PRODUCT_TYPE,
+                L1.DEFAULT_FUND_CONTRIB_INDICATOR,
+                L1.SME_FLAG,
+                L1.INTERNAL_TRANSACTION_FLAG,
+--                L1.IRB_RISK_WEIGHT_RATIO,  --R2157:R47.1:gargsi:commented:09/11/2017
+                NULL IRB_RISK_WEIGHT_RATIO,--R2157:R47.1:gargsi:added:09/11/2017--defaulted to NULL
+                L1.RWA_CALC_METHOD,
+                L1.TRADING_BOOK_FLAG,
+                L1.REPORTING_TYPE_CODE,
+                L1.CRD4_REP_IRB_FLAG,
+                L1.CRD4_REP_IRBEQ_FLAG,
+                L1.CRD4_REP_STD_FLAG,
+                L1.CRD4_REP_STDFLOW_FLAG,
+                L1.CRD4_REP_SETTL_FLAG,
+                L1.PERS_ACC_FLAG,
+                L1.B3_SME_RP_FLAG,
+                L1.B3_SME_DISCOUNT_FLAG,
+                NVL (COREP_INCORP_CURRENT.ISO_CODE, -1) COREP_INCORP_COUNTRY_NK,
+                L1.OBSRVD_NEW_DEFAULT_EXP_AMT,
+                L1.OBSRVD_NEW_DEFAULT_CR_ADJ,
+                L1.WALKER_COST_CENTRE_RK,
+                NVL (CRD4_MEMO_CURRENT.ASSET_CLASS_RK, -1) CRD4_MEMO_ITEMS_ASSET_CLASS_NK,
+                L1.IG_EXCLUSION_FLAG,   --R44.3--GARGSI:22-02-2017--ADDED:R2023
+                L1.RETAIL_POOL_SME_FLAG,      --R44.3--GARGSI:22-02-2017--ADDED:R2023
+                L1.SYS_CODE,   --R44.3--GARGSI:22-02-2017--ADDED-R2023
+                L1.DEAL_TYPE,  --r47.1:gargsi:added new column:13/10/2017
+                STS_SECURITISATION,       --R53:R2459:CLAYTON:Column Added
+                STS_SEC_QUAL_CAP_TRTMNT,  --R53:R2459:CLAYTON:Column Added
+                STS_SEC_APPROACH_CODE,    --R53:R2459:CLAYTON:Column Added
+                IFRS9_FINAL_STAGE,        --R53:TC412:CLAYTON:Column Added
+                IFRS9_STAGE_3_TYPE,       --R53:TC412:CLAYTON:Column Added
+                IFRS9_ECL_CURRENCY_CODE,  --R53:TC412:CLAYTON:Column Added
+                C33_EXPOSURE_SECTOR,         --R61:R2547:clayton:Column Added
+                FINREP_COUNTERPARTY_SECTOR,  --R61:R2547:clayton:Column Added
+                IAS39_CLASS,                 --R61:R2547:clayton:Column Added
+                REP_PROVISION_TYPE,          --R72:DC495:clayton:Column Added
+                CRR2_501A_DISCOUNT_FLAG,     --R72:DC495:clayton:Column Added
+                MORTGAGES_FLAG,              --R72:DC497:clayton:Column Added
+                SECURITY_NK_1_2,
+				SECURITY_NK_2_2                 --R72.1:TC548:clayton:Column Added
+           FROM tmp2_qtr_agg_corep_crd4_l1 L1
+                LEFT OUTER JOIN DIM_COUNTRY INCORP_COUNTRY_RK_PRIOR
+                   ON (INCORP_COUNTRY_RK_PRIOR.ISO_CODE =
+                          L1.INCORP_ISO_CODE)
+                LEFT OUTER JOIN DIM_COUNTRY INCORP_COUNTRY_RK_CURRENT
+                   ON (    NVL (INCORP_COUNTRY_RK_CURRENT.ISO_CODE, 'XX') =
+                              NVL (INCORP_COUNTRY_RK_PRIOR.ISO_CODE, 'XX')
+                       AND INCORP_COUNTRY_RK_CURRENT.VALID_FROM_DATE <= rDate
+                       AND INCORP_COUNTRY_RK_CURRENT.VALID_TO_DATE > rDate)
+                LEFT OUTER JOIN DIM_COUNTRY OP_COUNTRY_RK_PRIOR
+                   ON (OP_COUNTRY_RK_PRIOR.ISO_CODE = L1.OP_ISO_CODE)
+                LEFT OUTER JOIN DIM_COUNTRY OP_COUNTRY_RK_CURRENT
+                   ON (    NVL (OP_COUNTRY_RK_CURRENT.ISO_CODE, 'XX') =
+                              NVL (OP_COUNTRY_RK_PRIOR.ISO_CODE, 'XX')
+                       AND OP_COUNTRY_RK_CURRENT.VALID_FROM_DATE <= rDate
+                       AND OP_COUNTRY_RK_CURRENT.VALID_TO_DATE > rDate)
+                LEFT OUTER JOIN DIM_COUNTRY COREP_INCORP_PRIOR
+                   ON (COREP_INCORP_PRIOR.ISO_CODE =
+                          L1.COREP_INCORP_COUNTRY_NK)
+                LEFT OUTER JOIN DIM_COUNTRY COREP_INCORP_CURRENT
+                   ON (    NVL (COREP_INCORP_CURRENT.ISO_CODE, 'XX') =
+                              NVL (COREP_INCORP_PRIOR.ISO_CODE, 'XX')
+                       AND COREP_INCORP_CURRENT.VALID_FROM_DATE <= rDate
+                       AND COREP_INCORP_CURRENT.VALID_TO_DATE > rDate)
+                       --R2157:R47.1:gargsi:commented:09/11/2017-start--15/01/2017 TC224:R47.3.2:uncommented:start
+                LEFT OUTER JOIN DIM_PD_BAND MGS_PD_BAND_CODE_RK_PRIOR
+                   ON (MGS_PD_BAND_CODE_RK_PRIOR.MGS =
+                          L1.dim_mgs
+						AND MGS_PD_BAND_CODE_RK_PRIOR.PD_BAND_CODE =
+							L1.dim_pd_band_code
+						AND MGS_PD_BAND_CODE_RK_PRIOR.TYPE = L1.MGS_PD_BAND_type
+					)
+                LEFT OUTER JOIN DIM_PD_BAND MGS_PD_BAND_CODE_RK_CURRENT
+                   ON (    NVL (MGS_PD_BAND_CODE_RK_CURRENT.MGS, '9999') =
+                              NVL (MGS_PD_BAND_CODE_RK_PRIOR.MGS, '9999')
+                       AND MGS_PD_BAND_CODE_RK_CURRENT.VALID_FROM_DATE <=
+                              rDate
+                       AND MGS_PD_BAND_CODE_RK_CURRENT.VALID_TO_DATE > rDate)
+                    --R2157:R47.1:gargsi:commented:09/11/2017--end:15/01/2017 TC224:R47.3.2:uncommented:end
+                LEFT OUTER JOIN DIM_RRU RRU_RK_PRIOR
+                   ON (RRU_RK_PRIOR.LL_RRU = L1.RISK_TAKER_LL_RRU)
+                LEFT OUTER JOIN DIM_RRU RRU_RK_CURRENT
+                   ON (    NVL (RRU_RK_CURRENT.LL_RRU, 'XX') =
+                              NVL (RRU_RK_PRIOR.LL_RRU, 'XX')
+                       AND RRU_RK_CURRENT.VALID_FROM_DATE <= rDate
+                       AND RRU_RK_CURRENT.VALID_TO_DATE > rDate)
+                LEFT OUTER JOIN DIM_RRU RISK_ON_RRU_RK_PRIOR
+                   ON (RISK_ON_RRU_RK_PRIOR.LL_RRU = L1.RISK_ON_LL_RRU)
+                LEFT OUTER JOIN DIM_RRU RISK_ON_RRU_RK_CURRENT
+                   ON (    NVL (RISK_ON_RRU_RK_CURRENT.LL_RRU, 'XX') =
+                              NVL (RISK_ON_RRU_RK_PRIOR.LL_RRU, 'XX')
+                       AND RISK_ON_RRU_RK_CURRENT.VALID_FROM_DATE <= rDate
+                       AND RISK_ON_RRU_RK_CURRENT.VALID_TO_DATE > rDate)
+                LEFT OUTER JOIN DIM_ASSET_CLASS COREP_PRDEF_STD_PRIOR
+                   ON (COREP_PRDEF_STD_PRIOR.ASSET_CLASS_RK =
+                          L1.COREP_PRDEF_STD_ASSET_CLASS_NK)
+                LEFT OUTER JOIN DIM_ASSET_CLASS COREP_PRDEF_STD_CURRENT
+                   ON (    NVL (COREP_PRDEF_STD_CURRENT.REG_EXPOSURE_TYPE,
+                                'XXX') =
+                              NVL (COREP_PRDEF_STD_PRIOR.REG_EXPOSURE_TYPE,
+                                   'XXX')
+                       AND NVL (COREP_PRDEF_STD_CURRENT.BASEL_EXPOSURE_TYPE,
+                                'YYY') =
+                              NVL (COREP_PRDEF_STD_PRIOR.BASEL_EXPOSURE_TYPE,
+                                   'YYY')
+                       AND NVL (
+                              COREP_PRDEF_STD_CURRENT.BASEL_EXPOSURE_SUB_TYPE,
+                              'ZZZ') =
+                              NVL (
+                                 COREP_PRDEF_STD_PRIOR.BASEL_EXPOSURE_SUB_TYPE,
+                                 'ZZZ')
+                       AND NVL (COREP_PRDEF_STD_CURRENT.TYPE, 'ZZZ') =
+                              NVL (COREP_PRDEF_STD_PRIOR.TYPE, 'ZZZ')
+                       AND COREP_PRDEF_STD_CURRENT.VALID_FROM_DATE <= rDate
+                       AND COREP_PRDEF_STD_CURRENT.VALID_TO_DATE > rDate)
+                LEFT OUTER JOIN DIM_ASSET_CLASS COREP_IRB_PRIOR
+                   ON (COREP_IRB_PRIOR.ASSET_CLASS_RK =
+                          L1.COREP_IRB_ASSET_CLASS_RK)
+                LEFT OUTER JOIN DIM_ASSET_CLASS COREP_IRB_CURRENT
+                   ON (    NVL (COREP_IRB_CURRENT.REG_EXPOSURE_TYPE, 'XXX') =
+                              NVL (COREP_IRB_PRIOR.REG_EXPOSURE_TYPE, 'XXX')
+                       AND NVL (COREP_IRB_CURRENT.BASEL_EXPOSURE_TYPE, 'YYY') =
+                              NVL (COREP_IRB_PRIOR.BASEL_EXPOSURE_TYPE,
+                                   'YYY')
+                       AND NVL (COREP_IRB_CURRENT.BASEL_EXPOSURE_SUB_TYPE,
+                                'ZZZ') =
+                              NVL (COREP_IRB_PRIOR.BASEL_EXPOSURE_SUB_TYPE,
+                                   'ZZZ')
+                       AND NVL (COREP_IRB_CURRENT.TYPE, 'ZZZ') =
+                              NVL (COREP_IRB_PRIOR.TYPE, 'ZZZ')
+                       AND COREP_IRB_CURRENT.VALID_FROM_DATE <= rDate
+                       AND COREP_IRB_CURRENT.VALID_TO_DATE > rDate)
+                LEFT OUTER JOIN DIM_ASSET_CLASS COREP_STD_PRIOR
+                   ON (COREP_STD_PRIOR.ASSET_CLASS_RK =
+                          L1.COREP_STD_ASSET_CLASS_RK)
+                LEFT OUTER JOIN DIM_ASSET_CLASS COREP_STD_CURRENT
+                   ON (    NVL (COREP_STD_CURRENT.REG_EXPOSURE_TYPE, 'XXX') =
+                              NVL (COREP_STD_PRIOR.REG_EXPOSURE_TYPE, 'XXX')
+                       AND NVL (COREP_STD_CURRENT.BASEL_EXPOSURE_TYPE, 'YYY') =
+                              NVL (COREP_STD_PRIOR.BASEL_EXPOSURE_TYPE,
+                                   'YYY')
+                       AND NVL (COREP_STD_CURRENT.BASEL_EXPOSURE_SUB_TYPE,
+                                'ZZZ') =
+                              NVL (COREP_STD_PRIOR.BASEL_EXPOSURE_SUB_TYPE,
+                                   'ZZZ')
+                       AND NVL (COREP_STD_CURRENT.TYPE, 'ZZZ') =
+                              NVL (COREP_STD_PRIOR.TYPE, 'ZZZ')
+                       AND COREP_STD_CURRENT.VALID_FROM_DATE <= rDate
+                       AND COREP_STD_CURRENT.VALID_TO_DATE > rDate)
+                LEFT OUTER JOIN DIM_ASSET_CLASS CRD4_MEMO_PRIOR
+                   ON (CRD4_MEMO_PRIOR.ASSET_CLASS_RK =
+                          L1.CRD4_MEMO_ITEMS_ASSET_CLASS_NK)
+                LEFT OUTER JOIN DIM_ASSET_CLASS CRD4_MEMO_CURRENT
+                   ON (    NVL (CRD4_MEMO_CURRENT.REG_EXPOSURE_TYPE, 'XXX') =
+                              NVL (CRD4_MEMO_PRIOR.REG_EXPOSURE_TYPE, 'XXX')
+                       AND NVL (CRD4_MEMO_CURRENT.BASEL_EXPOSURE_TYPE, 'YYY') =
+                              NVL (CRD4_MEMO_PRIOR.BASEL_EXPOSURE_TYPE,
+                                   'YYY')
+                       AND NVL (CRD4_MEMO_CURRENT.BASEL_EXPOSURE_SUB_TYPE,
+                                'ZZZ') =
+                              NVL (CRD4_MEMO_PRIOR.BASEL_EXPOSURE_SUB_TYPE,
+                                   'ZZZ')
+                       AND NVL (CRD4_MEMO_CURRENT.TYPE, 'ZZZ') =
+                              NVL (CRD4_MEMO_PRIOR.TYPE, 'ZZZ')
+                       AND CRD4_MEMO_CURRENT.VALID_FROM_DATE <= rDate
+                       AND CRD4_MEMO_CURRENT.VALID_TO_DATE > rDate)
+                LEFT OUTER JOIN DIM_COST_CENTRE DIVISION_RK_PRIOR
+                   ON (DIVISION_RK_PRIOR.COST_CENTRE =
+                          L1.WALKER_COST_CENTRE_NK)
+                LEFT OUTER JOIN DIM_COST_CENTRE DIVISION_RK_CURRENT
+                   ON (    NVL (DIVISION_RK_CURRENT.COST_CENTRE, 'ZZZ') =
+                              NVL (DIVISION_RK_PRIOR.COST_CENTRE, 'ZZZ')
+                       AND NVL (DIVISION_RK_CURRENT.COST_CENTRE_TYPE, 'ZZZ') =
+                              NVL (DIVISION_RK_PRIOR.COST_CENTRE_TYPE, 'ZZZ')
+                       AND DIVISION_RK_CURRENT.VALID_FROM_DATE <= rDate
+                       AND DIVISION_RK_CURRENT.VALID_TO_DATE > rDate)'''
+	rekeying_df = spark.sql(query);
+	return rekeying_df;
+#	end of get_tmp_rekeying_l1()
+
+
+def get_merge_filter_cond():
+	filter_cond = [src.YEAR_MONTH = tgt.YEAR_MONTH, src.RISK_TAKER_LL_RRU = tgt.RISK_TAKER_LL_RRU, src.SUB5 = tgt.SUB5, src.RISK_ON_LL_RRU = tgt.RISK_ON_LL_RRU, 
+					src.COREP_IRB_ASSET_CLASS_RK = tgt.COREP_IRB_ASSET_CLASS_RK, src.COREP_STD_ASSET_CLASS_RK = tgt.COREP_STD_ASSET_CLASS_RK, 
+					src.COREP_PRDEF_STD_ASSET_CLASS_NK = tgt.COREP_PRDEF_STD_ASSET_CLASS_NK, src.UNSETTLED_PERIOD_CODE = tgt.UNSETTLED_PERIOD_CODE, 
+					src.INCORP_ISO_CODE = tgt.INCORP_ISO_CODE, src.OP_ISO_CODE = tgt.OP_ISO_CODE, src.dim_mgs = tgt.dim_mgs, src.dim_pd_band_code = tgt.dim_pd_band_code,src.MGS_PD_BAND_type = tgt.MGS_PD_BAND_type,
+					src.ADJUST_FLAG = tgt.ADJUST_FLAG, src.REPORTING_REGULATOR_CODE = tgt.REPORTING_REGULATOR_CODE, src.BASEL_DATA_FLAG = tgt.BASEL_DATA_FLAG, 
+					src.RWA_APPROACH_CODE = tgt.RWA_APPROACH_CODE, src.ACLM_PRODUCT_TYPE = tgt.ACLM_PRODUCT_TYPE, 
+					src.DEFAULT_FUND_CONTRIB_INDICATOR = tgt.DEFAULT_FUND_CONTRIB_INDICATOR, src.SME_FLAG = tgt.SME_FLAG, 
+					src.INTERNAL_TRANSACTION_FLAG = tgt.INTERNAL_TRANSACTION_FLAG, src.IRB_RISK_WEIGHT_RATIO = tgt.IRB_RISK_WEIGHT_RATIO, 
+					src.RWA_CALC_METHOD = tgt.RWA_CALC_METHOD, src.TRADING_BOOK_FLAG = tgt.TRADING_BOOK_FLAG, 
+					src.REPORTING_TYPE_CODE = tgt.REPORTING_TYPE_CODE, src.CRD4_REP_IRB_FLAG = tgt.CRD4_REP_IRB_FLAG, 
+					src.CRD4_REP_IRBEQ_FLAG = tgt.CRD4_REP_IRBEQ_FLAG, src.CRD4_REP_STD_FLAG = tgt.CRD4_REP_STD_FLAG, 
+					src.CRD4_REP_STDFLOW_FLAG = tgt.CRD4_REP_STDFLOW_FLAG, src.CRD4_REP_SETTL_FLAG = tgt.CRD4_REP_SETTL_FLAG, 
+					src.PERS_ACC_FLAG = tgt.PERS_ACC_FLAG, src.B3_SME_RP_FLAG = tgt.B3_SME_RP_FLAG, src.B3_SME_DISCOUNT_FLAG = tgt.B3_SME_DISCOUNT_FLAG, 
+					src.COREP_INCORP_COUNTRY_NK = tgt.COREP_INCORP_COUNTRY_NK, src.IG_EXCLUSION_FLAG = tgt.IG_EXCLUSION_FLAG, 
+					src.CRD4_MEMO_ITEMS_ASSET_CLASS_NK = tgt.CRD4_MEMO_ITEMS_ASSET_CLASS_NK, src.RETAIL_POOL_SME_FLAG = tgt.RETAIL_POOL_SME_FLAG, 
+					src.SYS_CODE = tgt.SYS_CODE, src.DEAL_TYPE = tgt.DEAL_TYPE, src.STS_SECURITISATION = tgt.STS_SECURITISATION, 
+					src.STS_SEC_QUAL_CAP_TRTMNT = tgt.STS_SEC_QUAL_CAP_TRTMNT, src.STS_SEC_APPROACH_CODE = tgt.STS_SEC_APPROACH_CODE, 
+					src.IFRS9_FINAL_STAGE = tgt.IFRS9_FINAL_STAGE, src.IFRS9_STAGE_3_TYPE = tgt.IFRS9_STAGE_3_TYPE, 
+					src.IFRS9_ECL_CURRENCY_CODE = tgt.IFRS9_ECL_CURRENCY_CODE, src.C33_EXPOSURE_SECTOR = tgt.C33_EXPOSURE_SECTOR, 
+					src.FINREP_COUNTERPARTY_SECTOR = tgt.FINREP_COUNTERPARTY_SECTOR, src.IAS39_CLASS = tgt.IAS39_CLASS, 
+					src.REP_PROVISION_TYPE = tgt.REP_PROVISION_TYPE, src.CRR2_501A_DISCOUNT_FLAG = tgt.CRR2_501A_DISCOUNT_FLAG, 
+					src.MORTGAGES_FLAG = tgt.MORTGAGES_FLAG, src.SECURITY_NK_1_2 = tgt.SECURITY_NK_1_2,src.SECURITY_NK_2_2 = tgt.SECURITY_NK_2_2];
+	return filter_cond;
+#	end of get_merge_filter_cond()
+
+
+def get_tgt_cols_to_select():
+	cols = [tgt.YEAR_MONTH, tgt.REPORTING_REGULATOR_CODE, tgt.RISK_TAKER_LL_RRU, tgt.SUB5, tgt.RISK_ON_LL_RRU, tgt.COREP_IRB_ASSET_CLASS_RK, 
+				tgt.COREP_STD_ASSET_CLASS_RK, tgt.COREP_PRDEF_STD_ASSET_CLASS_NK, tgt.UNSETTLED_PERIOD_CODE, tgt.INCORP_ISO_CODE, 
+				tgt.OP_ISO_CODE, tgt.dim_mgs,tgt.dim_pd_band_code,tgt.MGS_PD_BAND_type, tgt.ADJUST_FLAG, tgt.BASEL_DATA_FLAG, tgt.RWA_APPROACH_CODE, tgt.ACLM_PRODUCT_TYPE, 
+				tgt.DEFAULT_FUND_CONTRIB_INDICATOR, tgt.SME_FLAG, tgt.INTERNAL_TRANSACTION_FLAG, tgt.RWA_CALC_METHOD, tgt.TRADING_BOOK_FLAG, 
+				tgt.REPORTING_TYPE_CODE, tgt.CRD4_REP_IRB_FLAG, tgt.CRD4_REP_IRBEQ_FLAG, tgt.CRD4_REP_STD_FLAG, tgt.CRD4_REP_STDFLOW_FLAG, 
+				tgt.CRD4_REP_SETTL_FLAG, tgt.PERS_ACC_FLAG, tgt.B3_SME_RP_FLAG, tgt.B3_SME_DISCOUNT_FLAG, tgt.COREP_INCORP_COUNTRY_NK, 
+				tgt.WALKER_COST_CENTRE_NK, tgt.CRD4_MEMO_ITEMS_ASSET_CLASS_NK, tgt.IG_EXCLUSION_FLAG, tgt.RETAIL_POOL_SME_FLAG, tgt.SYS_CODE, 
+				tgt.DEAL_TYPE, tgt.STS_SECURITISATION, tgt.STS_SEC_QUAL_CAP_TRTMNT, tgt.STS_SEC_APPROACH_CODE, tgt.IFRS9_FINAL_STAGE, 
+				tgt.IFRS9_STAGE_3_TYPE, tgt.IFRS9_ECL_CURRENCY_CODE, tgt.C33_EXPOSURE_SECTOR, tgt.FINREP_COUNTERPARTY_SECTOR, 
+				tgt.IAS39_CLASS, tgt.REP_PROVISION_TYPE, tgt.CRR2_501A_DISCOUNT_FLAG, tgt.MORTGAGES_FLAG, tgt.SECURITY_NK_1_2,tgt.SECURITY_NK_2_2];
+	return cols;
+#	end of get_tgt_cols_to_select()
+
+
+if __name__ == "__main__":
+	#output_location = 's3://bucket-eu-west-1-978523670193-processed-data-s/presentation/rtd/srtd_mart/corep_crd4_mart'
+	reporting_date = '30/06/2022';
+	srtd_mart_db = "srtd_mart";
+	year_month = '202203';
+	
+	spark = get_spark_session()
+
+    #initializing the database rtd-mart
+	initialize_db(srtd_mart_db, spark);
+
+	###############################################################
+    ########-----Loading Input Data For QTR AGG Mart-----##########
+    ###############################################################
+	input_query = "select * from " + srtd_mart_db + ".rwa_reporting_agg_mart_l1 where adjust_flag = 'A' and year_month = " + year_month;
+	print("\n\nInput Query = ", input_query);
+	print("\n\n");
+	
+	rwa_reporting_agg_mart_data = spark.sql(input_query).distinct();
+	rwa_reporting_agg_mart_data = rwa_reporting_agg_mart_data.persist(StorageLevel.MEMORY_AND_DISK_SER);
+	
+	print("\n\nTotal input fetched from RWA_REPORTING_AGG_MART_DATA : ", rwa_reporting_agg_mart_data.count());
+	print("\n\n");
+
+	filter_cond = "B2_STD_OBSRVD_NEW_DEFAULT_FLAG = 'Y' or B2_IRB_OBSRVD_NEW_DEFAULT_FLAG = 'Y'";
+	qtr_agg_input_df = get_qtr_agg_input_df(rwa_reporting_agg_mart_data, filter_cond, None, None);
+	qtr_agg_input_df = qtr_agg_input_df.persist(StorageLevel.MEMORY_AND_DISK_SER);
+	
+	enriched_input_df = qtr_agg_input_df.rdd.mapPartitions(enrich_qtr_agg_input).toDF();
+	input_df_group_cols = get_input_data_group_by_cols()
+	final_input_df = enriched_input_df.groupBy(input_df_group_cols).agg(sum("OBSRVD_NEW_DEFAULT_EXP_AMT_INDV").alias("OBSRVD_NEW_DEFAULT_EXP_AMT"),
+																		sum("OBSRVD_NEW_DEFAULT_CR_ADJ_INDV").alias("OBSRVD_NEW_DEFAULT_CR_ADJ"));
+	
+	final_input_df.select("YEAR_MONTH", "REPORTING_REGULATOR_CODE", "OBSRVD_NEW_DEFAULT_EXP_AMT", "OBSRVD_NEW_DEFAULT_CR_ADJ").show(1, False);
+	
+	curr_qtr_details = get_curr_qtr_mnths(spark,reporting_date_override);
+	curr_qtr_mnths = curr_qtr_details.rdd.map(lambda x: x[1]).collect();
+	
+	tmp2_qtr_agg_corep_crd4_l1 = get_tmp2_qtr_agg_corep_crd4_l1(rwa_reporting_agg_mart_data, curr_qtr_mnths);
+	tmp2_qtr_agg_corep_crd4_l1 = tmp2_qtr_agg_corep_crd4_l1.persist(StorageLevel.MEMORY_AND_DISK_SER);
+	tmp2_qtr_agg_corep_crd4_l1.createOrReplaceTempView(tmp2_qtr_agg_corep_crd4_l1);
+	
+	tmp_rekeying_df = get_tmp_rekeying_l1();
+	
+	tmp_qtr_agg_corep_crd4_l1 = final_input_df.unionByName(tmp_rekeying_df);
+	
+	#Final Qtr Agg data becomes src data for merging in agg_mart_l1
+	qtr_agg_corep = tmp_qtr_agg_corep_crd4_l1.groupBy(input_df_group_cols).agg(sum("OBSRVD_NEW_DEFAULT_EXP_AMT").alias("OBSRVD_NEW_DEFAULT_EXP_AMT_AGG"),
+																		sum("OBSRVD_NEW_DEFAULT_CR_ADJ").alias("OBSRVD_NEW_DEFAULT_CR_ADJ_AGG"));						
+	qtr_agg_corep.createOrReplaceTempView("src");
+	
+	#Final agg_mart_l1 becomes destination to above calculated qtr_agg data
+	agg_mart_l1_query = "select * from " + srtd_mart_db + ".rwa_reporting_agg_mart_l1 where year_month = " + year_month;
+	agg_mart_l1 = spark.sql(agg_mart_l1_query);
+	agg_mart_l1.createOrReplaceTempView("tgt");
+	
+	filter_cond = get_merge_filter_cond();
+	cols_to_select = get_tgt_cols_to_select() + [tgt.IRB_RISK_WEIGHT_RATIO, src.OBSRVD_NEW_DEFAULT_EXP_AMT, src.OBSRVD_NEW_DEFAULT_CR_ADJ];
+	
+	#returns rows present in both the places -- qtr_agg and agg_mart_l1
+	rows_present_in_tgt = qtr_agg_corep.join(agg_mart_l1, on = filter_cond, how = "inner").select(cols_to_select);
+	
+	updated_rows_in_tgt = rows_present_in_tgt.rdd.mapPartitions(updating_tgt_rows).toDF();
+	
+	rows_not_in_tgt = qtr_agg_corep.join(agg_mart_l1, on = filter_cond, how = "leftanti");
+
+	#returns rows present in qtr_agg output only
+	
+	union_df = updated_rows_in_tgt.unionByName(rows_not_in_tgt);
